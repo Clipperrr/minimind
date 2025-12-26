@@ -38,7 +38,7 @@ class CriticModel(MiniMindForCausalLM):
         hidden_states = self.model.norm(outputs[0])
         # 使用value_head获取价值估计
         values = self.value_head(hidden_states).squeeze(-1)
-        return values
+        return values # [batch_size, seq_len]
 
 
 def calculate_rewards(prompts, responses, reward_model, reward_tokenizer):
@@ -124,7 +124,7 @@ def ppo_train_epoch(epoch, loader, iters, old_actor_model, ref_model, actor_sche
         prompts = batch["prompt"]  # list[str], length B
         enc = tokenizer(prompts, return_tensors="pt", padding=True, truncation=True, 
                        max_length=args.max_seq_len).to(args.device)  # input_ids: [B, P], attention_mask: [B, P]
-        prompt_lengths = torch.full((enc.input_ids.size(0),), enc.input_ids.shape[1], dtype=torch.long, device=enc.input_ids.device)  # [B]
+        prompt_lengths = torch.full((enc.input_ids.size(0),), enc.input_ids.shape[1], dtype=torch.long, device=enc.input_ids.device)  # [B] 每个的序列长度
 
         with torch.no_grad():
             # DDP 模型需要使用 .module 访问 generate 方法
@@ -132,7 +132,7 @@ def ppo_train_epoch(epoch, loader, iters, old_actor_model, ref_model, actor_sche
             gen_out = model_for_gen.generate(
                 input_ids=enc.input_ids, attention_mask=enc.attention_mask,
                 max_new_tokens=args.max_gen_len, do_sample=True, temperature=0.8,
-                pad_token_id=tokenizer.pad_token_id, eos_token_id=tokenizer.eos_token_id)  # [B, P+R]
+                pad_token_id=tokenizer.pad_token_id, eos_token_id=tokenizer.eos_token_id)  # [B, P+R]   Prompt + Response
 
         responses_text = [tokenizer.decode(gen_out[i, prompt_lengths[i]:], skip_special_tokens=True) for i in range(len(prompts))]
         rewards = calculate_rewards(prompts, responses_text, reward_model, reward_tokenizer)  # [B]
@@ -140,27 +140,27 @@ def ppo_train_epoch(epoch, loader, iters, old_actor_model, ref_model, actor_sche
         full_mask = (gen_out != tokenizer.pad_token_id).long()  # [B, P+R]
         values_seq = critic_model(input_ids=gen_out, attention_mask=full_mask)  # [B, P+R]
         last_indices = (full_mask * torch.arange(full_mask.size(1), device=gen_out.device)).argmax(dim=1)
-        values = values_seq[torch.arange(values_seq.size(0), device=values_seq.device), last_indices]  # [B]
+        values = values_seq[torch.arange(values_seq.size(0), device=values_seq.device), last_indices]  # [B]  Tensor中取各维度的第几个
         advantages = rewards - values.detach()  # [B]
 
-        logits = actor_model(input_ids=gen_out, attention_mask=full_mask).logits  # [B, P+R, V]
-        labels = gen_out[:, 1:].clone()  # [B, P+R-1]
-        logp_tokens = F.log_softmax(logits[:, :-1], dim=-1).gather(2, labels.unsqueeze(-1)).squeeze(-1)  # [B, P+R-1]
+        logits = actor_model(input_ids=gen_out, attention_mask=full_mask).logits  # [B, P+R, 词汇表大小]  这里是总的输出的softmax前的logits
+        labels = gen_out[:, 1:].clone()  # [B, P+R-1] 这里输出的是每个词的tokenized  pytorch切片不是deepcopy
+        logp_tokens = F.log_softmax(logits[:, :-1], dim=-1).gather(2, labels.unsqueeze(-1)).squeeze(-1)  # [B, P+R-1]  这里取的是每个token对应的预测的logits中标签（也就是GT）的log概率
         seq_len = gen_out.size(1) - 1
-        resp_mask = torch.arange(seq_len, device=gen_out.device).unsqueeze(0) >= prompt_lengths.unsqueeze(1)
-        final_mask = resp_mask & (~labels.eq(tokenizer.pad_token_id))  # [B, P+R-1]
-        actor_logp = (logp_tokens * final_mask).sum(dim=1)  # [B]
+        resp_mask = torch.arange(seq_len, device=gen_out.device).unsqueeze(0) >= prompt_lengths.unsqueeze(1)  #只取response部分的mask [B, P+R-1]
+        final_mask = resp_mask & (~labels.eq(tokenizer.pad_token_id))  # [B, P+R-1] 同时排除填充token
+        actor_logp = (logp_tokens * final_mask).sum(dim=1)  # [B] log相加为相乘
 
         with torch.no_grad():
-            old_logits = old_actor_model(input_ids=gen_out, attention_mask=full_mask).logits  # [B, P+R, V]
+            old_logits = old_actor_model(input_ids=gen_out, attention_mask=full_mask).logits  # [B, P+R, 词汇表大小]
             old_logp_tokens = F.log_softmax(old_logits[:, :-1], dim=-1).gather(2, labels.unsqueeze(-1)).squeeze(-1)  # [B, P+R-1]
             old_logp = (old_logp_tokens * final_mask).sum(dim=1)  # [B]
             
-            ref_logits = ref_model(input_ids=gen_out, attention_mask=full_mask).logits  # [B, P+R, V]
+            ref_logits = ref_model(input_ids=gen_out, attention_mask=full_mask).logits  # [B, P+R, 词汇表大小]
             ref_logp_tokens = F.log_softmax(ref_logits[:, :-1], dim=-1).gather(2, labels.unsqueeze(-1)).squeeze(-1)  # [B, P+R-1]
-            ref_logp = (ref_logp_tokens * final_mask).sum(dim=1)  # [B]
+            ref_logp = (ref_logp_tokens * final_mask).sum(dim=1)  # [B] 
 
-        kl = (actor_logp - old_logp).mean()  # scalar
+        kl = (actor_logp - old_logp).mean()  # scalar    Monte Carlo估计的KL散度
         kl_ref = (actor_logp - ref_logp).mean()  # scalar
         ratio = torch.exp(actor_logp - old_logp)  # [B]
         surr1 = ratio * advantages  # [B]
@@ -168,7 +168,7 @@ def ppo_train_epoch(epoch, loader, iters, old_actor_model, ref_model, actor_sche
         policy_loss = -torch.min(surr1, surr2).mean()  # scalar
         value_loss = F.mse_loss(values, rewards)  # scalar
         loss = policy_loss + args.vf_coef * value_loss + args.kl_coef * kl_ref  # scalar
-        loss.backward()
+        loss.backward()   # 反向传播计算梯度,会分别累积到 actor_model 和 critic_model 中
 
         if (step + 1) % args.accumulation_steps == 0:
             clip_grad_norm_(actor_model.parameters(), args.grad_clip)

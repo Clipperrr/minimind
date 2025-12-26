@@ -22,7 +22,7 @@ def Logger(content):
         print(content)
 
 
-def get_lr(current_step, total_steps, lr):
+def get_lr(current_step, total_steps, lr): # 余弦退火学习率调度
     return lr*(0.1 + 0.45*(1 + math.cos(math.pi * current_step / total_steps)))
 
 
@@ -140,4 +140,3 @@ class SkipBatchSampler(Sampler):
     def __len__(self):
         total_batches = (len(self.sampler) + self.batch_size - 1) // self.batch_size
         return max(0, total_batches - self.skip_batches)
-

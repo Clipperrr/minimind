@@ -220,13 +220,13 @@ class FeedForward(nn.Module):
     def __init__(self, config: MiniMindConfig):
         super().__init__()
         if config.intermediate_size is None:
-            intermediate_size = int(config.hidden_size * 8 / 3)
-            config.intermediate_size = 64 * ((intermediate_size + 64 - 1) // 64)
-        self.gate_proj = nn.Linear(config.hidden_size, config.intermediate_size, bias=False)
+            intermediate_size = int(config.hidden_size * 8 / 3)   #经验式放大倍数
+            config.intermediate_size = 64 * ((intermediate_size + 64 - 1) // 64)    #向上对齐到64的倍数
+        self.gate_proj = nn.Linear(config.hidden_size, config.intermediate_size, bias=False)   #本质也是FFN，只是多一个门
         self.down_proj = nn.Linear(config.intermediate_size, config.hidden_size, bias=False)
         self.up_proj = nn.Linear(config.hidden_size, config.intermediate_size, bias=False)
         self.dropout = nn.Dropout(config.dropout)
-        self.act_fn = ACT2FN[config.hidden_act]
+        self.act_fn = ACT2FN[config.hidden_act]   # ACT2CLS 是一个 激活函数类名 -> 激活类的映射 gilu
 
     def forward(self, x):
         return self.dropout(self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x)))
@@ -253,8 +253,9 @@ class MoEGate(nn.Module):
 
     def forward(self, hidden_states):
         bsz, seq_len, h = hidden_states.shape
-        hidden_states = hidden_states.view(-1, h)
+        hidden_states = hidden_states.view(-1, h)     #针对token的打分，将batch的tokens合并
         logits = F.linear(hidden_states, self.weight, None)
+        #self.weight:(n_routed_experts, gating_dim) 输出每个token对每个专家的原始分数（logits）这里要转置哦！
         if self.scoring_func == 'softmax':
             scores = logits.softmax(dim=-1)
         else:
@@ -272,15 +273,18 @@ class MoEGate(nn.Module):
             topk_idx_for_aux_loss = topk_idx.view(bsz, -1)
             if self.seq_aux:
                 scores_for_seq_aux = scores_for_aux.view(bsz, seq_len, -1)
-                ce = torch.zeros(bsz, self.n_routed_experts, device=hidden_states.device)
-                ce.scatter_add_(1, topk_idx_for_aux_loss,
+                ce = torch.zeros(bsz, self.n_routed_experts, device=hidden_states.device)  #ce反应这个专家被选择的频率
+                ce.scatter_add_(1, topk_idx_for_aux_loss,  #统计选择专家个数
                                 torch.ones(bsz, seq_len * aux_topk, device=hidden_states.device)).div_(
-                    seq_len * aux_topk / self.n_routed_experts)
-                aux_loss = (ce * scores_for_seq_aux.mean(dim=1)).sum(dim=1).mean() * self.alpha
+                    seq_len * aux_topk / self.n_routed_experts)      #除以理想均匀分布下每个专家应该被选择的次数，保证都能选到
+                aux_loss = (ce * scores_for_seq_aux.mean(dim=1)).sum(dim=1).mean() * self.alpha   #主要针对是专家
+                # 得到每个batch中每个专家的：选择频率 × 平均路由分数，然后sum前的维度是[bsz x n_routed_experts]， 在求和为[bsz],
+                # 反应整个专家系统的选择频率 × 平均路由分数
             else:
                 mask_ce = F.one_hot(topk_idx_for_aux_loss.view(-1), num_classes=self.n_routed_experts)
-                ce = mask_ce.float().mean(0)
-                Pi = scores_for_aux.mean(0)
+                #展平成[bsz * len x n_routed_experts]
+                ce = mask_ce.float().mean(0) # (n_routed_experts,)
+                Pi = scores_for_aux.mean(0)  # (n_routed_experts)
                 fi = ce * self.n_routed_experts
                 aux_loss = (Pi * fi).sum() * self.alpha
         else:

@@ -46,12 +46,12 @@ class PretrainDataset(Dataset):
         loss_mask = (input_ids != self.tokenizer.pad_token_id)
 
         X = torch.tensor(input_ids[:-1], dtype=torch.long)
-        Y = torch.tensor(input_ids[1:], dtype=torch.long)
-        loss_mask = torch.tensor(loss_mask[1:], dtype=torch.long)
+        Y = torch.tensor(input_ids[1:], dtype=torch.long)         
+        loss_mask = torch.tensor(loss_mask[1:], dtype=torch.long)  #仅仅对非pad位置计算loss
         return X, Y, loss_mask
 
 
-class SFTDataset(Dataset):
+class SFTDataset(Dataset):  # 对于PreTrain来说，这个主要是多了结构化和多对话的处理
     def __init__(self, jsonl_path, tokenizer, max_length=1024):
         super().__init__()
         self.tokenizer = tokenizer
@@ -73,7 +73,7 @@ class SFTDataset(Dataset):
 
     def _create_chat_prompt(self, cs):
         messages = cs.copy()
-        tools = cs[0]["functions"] if (cs and cs[0]["role"] == "system" and cs[0].get("functions")) else None
+        tools = cs[0]["functions"] if (cs and cs[0]["role"] == "system" and cs[0].get("functions")) else None #现代大模型支持定义工具/函数，会根据是否有tools调整格式
         return self.tokenizer.apply_chat_template(
             messages,
             tokenize=False,
@@ -89,12 +89,12 @@ class SFTDataset(Dataset):
                 start = i + len(self.bos_id)
                 end = start
                 while end < len(input_ids):
-                    if input_ids[end:end + len(self.eos_id)] == self.eos_id:
+                    if input_ids[end:end + len(self.eos_id)] == self.eos_id:   #mask非回答部分
                         break
                     end += 1
                 for j in range(start + 1, min(end + len(self.eos_id) + 1, self.max_length)):
                     loss_mask[j] = 1
-                i = end + len(self.eos_id) if end < len(input_ids) else len(input_ids)
+                i = end + len(self.eos_id) if end < len(input_ids) else len(input_ids)  # 一个对话中可能包含多个assistant回复（比如多轮对话）
             else:
                 i += 1
         return loss_mask
@@ -103,8 +103,8 @@ class SFTDataset(Dataset):
         sample = self.samples[index]
         # 构建对话提示
         prompt = self._create_chat_prompt(sample['conversations'])
-        input_ids = self.tokenizer(prompt).input_ids[:self.max_length]
-        input_ids += [self.tokenizer.pad_token_id] * (self.max_length - len(input_ids))
+        input_ids = self.tokenizer(prompt).input_ids[:self.max_length]      #截断
+        input_ids += [self.tokenizer.pad_token_id] * (self.max_length - len(input_ids))        #填充
 
         # 生成动态损失掩码
         loss_mask = self._generate_loss_mask(input_ids)
