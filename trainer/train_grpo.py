@@ -135,11 +135,16 @@ def grpo_train_epoch(epoch, loader, iters, ref_model, reward_model, reward_token
         is_eos = completion_ids == tokenizer.eos_token_id  # [B*num_gen, R]
         eos_idx = torch.full((is_eos.size(0),), is_eos.size(1), dtype=torch.long, device=args.device)
         eos_idx[is_eos.any(dim=1)] = is_eos.int().argmax(dim=1)[is_eos.any(dim=1)]
-        completion_mask = (torch.arange(is_eos.size(1), device=args.device).expand(is_eos.size(0), -1) <= eos_idx.unsqueeze(1)).int()  # [B*num_gen, R]
+        completion_mask = (
+            torch.arange(is_eos.size(1), device=args.device)   # 创建 [0, 1, 2, ..., R-1] 的序列
+            .expand(is_eos.size(0), -1)  # [B*num_gen, R]
+            <= eos_idx.unsqueeze(1)
+            ).int()  # [B*num_gen, R]
 
         kl_div = ref_per_token_logps - per_token_logps
-        per_token_kl = torch.exp(kl_div) - kl_div - 1  # [B*num_gen, R]
-        per_token_loss = -(torch.exp(per_token_logps - per_token_logps.detach()) * advantages.unsqueeze(1) - args.beta * per_token_kl)  # [B*num_gen, R]
+        per_token_kl = torch.exp(kl_div) - kl_div - 1  # [B*num_gen, R]  ref和cur的KL惩罚
+        per_token_loss = -(torch.exp(per_token_logps - per_token_logps.detach()) * advantages.unsqueeze(1) #这一项在前向计算时恒等于 advantages，但在反向传播时，它的梯度等价于advantages × ∇ logπ。
+                           - args.beta * per_token_kl)  # [B*num_gen, R]
         loss = ((per_token_loss * completion_mask).sum(dim=1) / completion_mask.sum(dim=1)).mean() / args.accumulation_steps  # scalar
         loss.backward()
 
@@ -192,7 +197,7 @@ if __name__ == "__main__":
     parser.add_argument("--save_dir", type=str, default="../out", help="模型保存目录")
     parser.add_argument('--save_weight', default='grpo', type=str, help="保存权重的前缀名")
     parser.add_argument("--epochs", type=int, default=1, help="训练轮数")
-    parser.add_argument("--batch_size", type=int, default=2, help="batch size")
+    parser.add_argument("--batch_size", type=int, default=4, help="batch size")
     parser.add_argument("--learning_rate", type=float, default=8e-8, help="初始学习率")
     parser.add_argument("--device", type=str, default="cuda:0" if torch.cuda.is_available() else "cpu", help="训练设备")
     parser.add_argument("--dtype", type=str, default="bfloat16", help="混合精度类型")

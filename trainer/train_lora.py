@@ -14,7 +14,7 @@ from torch import optim, nn
 from torch.nn.parallel import DistributedDataParallel
 from torch.utils.data import DataLoader, DistributedSampler
 from model.model_minimind import MiniMindConfig
-from dataset.lm_dataset import SFTDataset
+from dataset.lm_dataset import SFTDataset, CSVDataset
 from model.model_lora import save_lora, apply_lora
 from trainer.trainer_utils import get_lr, Logger, is_main_process, lm_checkpoint, init_distributed_mode, setup_seed, init_model, SkipBatchSampler
 
@@ -146,7 +146,10 @@ if __name__ == "__main__":
             param.requires_grad = False
     
     # ========== 6. 定义数据和优化器 ==========
-    train_ds = SFTDataset(args.data_path, tokenizer, max_length=args.max_seq_len)
+    if args.data_path.endswith('.csv'):
+        train_ds = CSVDataset(args.data_path, tokenizer, max_length=args.max_seq_len)
+    else:
+        train_ds = SFTDataset(args.data_path, tokenizer, max_length=args.max_seq_len)
     train_sampler = DistributedSampler(train_ds) if dist.is_initialized() else None
     scaler = torch.cuda.amp.GradScaler(enabled=(args.dtype == 'float16'))
     optimizer = optim.AdamW(lora_params, lr=args.learning_rate)
@@ -176,3 +179,5 @@ if __name__ == "__main__":
         else: # 默认从头开始
             loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=(train_sampler is None), sampler=train_sampler, num_workers=args.num_workers, pin_memory=True)
             train_epoch(epoch, loader, len(loader), lora_params, 0, wandb)
+    # ========== 10. 训练完成，保存最终LoRA权重 ==========
+    

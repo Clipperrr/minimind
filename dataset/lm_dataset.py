@@ -3,7 +3,7 @@ import pandas as pd
 import numpy as np
 from torch.utils.data import Dataset, DataLoader
 import torch
-import os
+import os, re
 
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
@@ -44,6 +44,88 @@ class PretrainDataset(Dataset):
         Y = torch.tensor(input_ids[1:], dtype=torch.long)         
         loss_mask = torch.tensor(loss_mask[1:], dtype=torch.long)  #仅仅对非pad位置计算loss
         return X, Y, loss_mask
+    
+class CSVDataset(Dataset):
+    def __init__(self, data_path, tokenizer, max_length=512):
+        super().__init__()
+        self.tokenizer = tokenizer
+        self.max_length = max_length
+
+        self.im_start = tokenizer.convert_tokens_to_ids("<|im_start|>")
+        self.im_end = tokenizer.convert_tokens_to_ids("<|im_end|>")
+
+        self.samples = self.load_data(data_path)
+
+    def load_data(self, data_path):
+        import pandas as pd
+        import re
+
+        df = pd.read_csv(data_path)
+        samples = []
+
+        # 预留 <|im_start|> + <|im_end|>
+        max_len = self.max_length - 2
+
+        for _, row in df.iterrows():
+            text = str(row["context"]).strip()
+            if not text:
+                continue
+
+            # 按鲁迅友好的标点切句
+            sentences = re.split(r'(?<=[。！？])', text)
+
+            buf_ids = []
+
+            for sent in sentences:
+                sent = sent.strip()
+                if not sent:
+                    continue
+
+                sent_ids = self.tokenizer.encode(
+                    sent, add_special_tokens=False
+                )
+
+                if len(buf_ids) + len(sent_ids) <= max_len:
+                    buf_ids.extend(sent_ids)
+                else:
+                    if buf_ids:
+                        samples.append({
+                            "input_ids": (
+                                [self.im_start] +
+                                buf_ids +
+                                [self.im_end]
+                            )
+                        })
+                    buf_ids = sent_ids
+
+            # 收尾
+            if buf_ids:
+                samples.append({
+                    "input_ids": (
+                        [self.im_start] +
+                        buf_ids +
+                        [self.im_end]
+                    )
+                })
+
+        return samples
+
+    def __len__(self):
+        return len(self.samples)
+
+    def __getitem__(self, index):
+        ids = self.samples[index]["input_ids"]
+
+        ids = ids[:self.max_length]
+        pad_len = self.max_length - len(ids)
+        if pad_len > 0:
+            ids = ids + [self.tokenizer.pad_token_id] * pad_len
+
+        input_ids = torch.tensor(ids[:-1], dtype=torch.long)
+        labels = torch.tensor(ids[1:], dtype=torch.long)
+
+        loss_mask = (labels != self.tokenizer.pad_token_id).long()
+        return input_ids, labels, loss_mask
 
 
 class SFTDataset(Dataset):  # 对于PreTrain来说，这个主要是多了结构化和多对话的处理

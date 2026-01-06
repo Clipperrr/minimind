@@ -21,7 +21,7 @@ from transformers import AutoModel
 from model.model_minimind import MiniMindConfig, MiniMindForCausalLM
 from dataset.lm_dataset import RLAIFDataset
 from trainer.trainer_utils import Logger, is_main_process, lm_checkpoint, init_distributed_mode, setup_seed, SkipBatchSampler, init_model
-
+from collections import Counter
 warnings.filterwarnings('ignore')
 
 
@@ -41,8 +41,18 @@ class CriticModel(MiniMindForCausalLM):
         return values # [batch_size, seq_len]
 
 
-def calculate_rewards(prompts, responses, reward_model, reward_tokenizer):
+def calculate_rewards(prompts, responses, reward_model, reward_tokenizer, tokenizer):
     """整合所有奖励函数计算总奖励"""
+
+    def low_diversity_penalty(text, tokenizer, min_ratio=0.3, weight=-1.0):
+        ids = tokenizer.encode(text, add_special_tokens=False)
+        if len(ids) < 10:
+            return 0.0
+        uniq_ratio = len(set(ids)) / len(ids)
+        if uniq_ratio < min_ratio:
+            return weight * (min_ratio - uniq_ratio) / min_ratio
+        return 0.0
+
     def reasoning_model_reward(rewards):
         # 1. 格式奖励（仅针对训练推理模型时使用）
         pattern = r"^<think>\n.*?\n</think>\n<answer>\n.*?\n</answer>$"
@@ -58,28 +68,55 @@ def calculate_rewards(prompts, responses, reward_model, reward_tokenizer):
             elif match_pattern2:
                 format_rewards.append(0.5)
             else:
-                format_rewards.append(0.0)
+                format_rewards.append(-1.5)
         rewards += torch.tensor(format_rewards, device=args.device)
-
+        print("格式奖励:", format_rewards)
         # 2. 标记奖励（防止严格奖励稀疏，仅针对训练推理模型时使用）
         def mark_num(text):
             reward = 0
-            if text.count("<think>") == 1:
-                reward += 0.25
-            if text.count("</think>") == 1:
-                reward += 0.25
-            if text.count("<answer>") == 1:
-                reward += 0.25
-            if text.count("</answer>") == 1:
-                reward += 0.25
+            if text.count("<think>") == 1 and text.count("</think>") == 1:
+                reward += 0.50
+            elif text.count("<think>") > 1 or text.count("</think>") > 1:
+                reward -= 1.0
+            if text.count("<answer>") == 1 and text.count("</answer>") == 1:
+                reward += 0.50
+            elif text.count("<answer>") > 1 or text.count("</answer>") > 1:
+                reward -= 1.0
+            if reward > 0:
+                reward += 0.5  # 额外的成对奖励
+            else:
+                reward -= 1.5
             return reward
 
         mark_rewards = [mark_num(response) for response in responses]
         rewards += torch.tensor(mark_rewards, device=args.device)
         return rewards
 
-    rewards = torch.zeros(len(responses), device=args.device)
+    def ngram_penalty(responses, tokenizer, n=3, weight=-1.0):
+        rewards = []
 
+        for text in responses:
+            ids = tokenizer.encode(text, add_special_tokens=False)
+            if len(ids) < n:
+                rewards.append(0.0)
+                continue
+
+            ngrams = [tuple(ids[i:i+n]) for i in range(len(ids)-n+1)]
+            counts = Counter(ngrams)
+
+            repeated = sum(c - 1 for c in counts.values() if c > 1)
+            rewards.append(weight * (repeated / len(ngrams)))
+
+        return torch.tensor(rewards, device=args.device)
+
+    rewards = ngram_penalty(responses, tokenizer, weight=-1.0)
+    div_penalties = torch.tensor(
+        [low_diversity_penalty(t, tokenizer, weight=-1.5) for t in responses],
+        device=args.device
+    )
+    print("多样性惩罚:", div_penalties)
+    print("重复n-gram惩罚:", rewards)
+    rewards += div_penalties
     # 格式奖励
     if args.reasoning == 1:
         rewards = reasoning_model_reward(rewards)
@@ -107,7 +144,7 @@ def calculate_rewards(prompts, responses, reward_model, reward_tokenizer):
                     tmp_chat = messages + [{"role": "assistant", "content": answer_content}]
                     answer_score = reward_model.get_score(reward_tokenizer, tmp_chat)
                     answer_score = max(min(answer_score, scale), -scale)
-                    score = score * 0.4 + answer_score * 0.6
+                    score = score * 0.5 + answer_score * 0.5
             reward_model_scores.append(score)
 
         reward_model_scores = torch.tensor(reward_model_scores, device=args.device)
@@ -116,7 +153,7 @@ def calculate_rewards(prompts, responses, reward_model, reward_tokenizer):
     return rewards
 
 
-def ppo_train_epoch(epoch, loader, iters, old_actor_model, ref_model, actor_scheduler, critic_scheduler, reward_model, reward_tokenizer, start_step=0, wandb=None):
+def ppo_train_epoch(epoch, loader, iters, old_actor_model, ref_model, actor_scheduler, critic_scheduler, reward_model, reward_tokenizer, tokenizer, start_step=0, wandb=None):
     actor_model.train()
     critic_model.train()
 
@@ -135,13 +172,14 @@ def ppo_train_epoch(epoch, loader, iters, old_actor_model, ref_model, actor_sche
                 pad_token_id=tokenizer.pad_token_id, eos_token_id=tokenizer.eos_token_id)  # [B, P+R]   Prompt + Response
 
         responses_text = [tokenizer.decode(gen_out[i, prompt_length:], skip_special_tokens=True) for i in range(len(prompts))]
-        rewards = calculate_rewards(prompts, responses_text, reward_model, reward_tokenizer)  # [B]
+        rewards = calculate_rewards(prompts, responses_text, reward_model, reward_tokenizer, tokenizer)  # [B]
 
         full_mask = (gen_out != tokenizer.pad_token_id).long()  # [B, P+R]
         values_seq = critic_model(input_ids=gen_out, attention_mask=full_mask)  # [B, P+R]
         last_indices = (full_mask * torch.arange(full_mask.size(1), device=gen_out.device)).argmax(dim=1)
         values = values_seq[torch.arange(values_seq.size(0), device=values_seq.device), last_indices]  # [B]  Tensor中取各维度的第几个
         advantages = rewards - values.detach()  # [B]
+        advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)  # 标准化优势函数
 
         logits = actor_model(input_ids=gen_out, attention_mask=full_mask).logits  # [B, P+R, 词汇表大小]  这里是总的输出的softmax前的logits
         labels = gen_out[:, 1:].clone()  # [B, P+R-1] 这里输出的是每个词的tokenized  pytorch切片不是deepcopy
@@ -186,7 +224,7 @@ def ppo_train_epoch(epoch, loader, iters, old_actor_model, ref_model, actor_sche
             is_eos = (response_ids == tokenizer.eos_token_id)
             eos_indices = torch.argmax(is_eos.int(), dim=1)
             has_eos = is_eos.any(dim=1)
-            lengths = torch.where(has_eos, eos_indices + 1, torch.tensor(response_ids.shape[1], device=is_eos.device))
+            lengths = torch.where(has_eos, eos_indices + 1, torch.tensor(response_ids.shape[1], device=is_eos.device)) #has_eos为True时取eos位置+1，否则取最大长度
             avg_len = lengths.float().mean()
 
             actor_loss_val = policy_loss.item()
@@ -245,7 +283,7 @@ if __name__ == "__main__":
     parser.add_argument("--save_dir", type=str, default="../out", help="模型保存目录")
     parser.add_argument('--save_weight', default='ppo_actor', type=str, help="保存权重的前缀名")
     parser.add_argument("--epochs", type=int, default=1, help="训练轮数")
-    parser.add_argument("--batch_size", type=int, default=2, help="batch size")
+    parser.add_argument("--batch_size", type=int, default=8, help="batch size")
     parser.add_argument("--learning_rate", type=float, default=8e-8, help="Actor学习率")
     parser.add_argument("--critic_learning_rate", type=float, default=8e-8, help="Critic学习率")
     parser.add_argument("--device", type=str, default="cuda:0" if torch.cuda.is_available() else "cpu", help="训练设备")
@@ -259,7 +297,7 @@ if __name__ == "__main__":
     parser.add_argument('--num_hidden_layers', default=8, type=int, help="隐藏层数量")
     parser.add_argument('--use_moe', default=0, type=int, choices=[0, 1], help="是否使用MoE架构（0=否，1=是）")
     parser.add_argument('--max_seq_len', default=66, type=int, help="Prompt最大长度")
-    parser.add_argument("--max_gen_len", type=int, default=1536, help="生成的最大长度")
+    parser.add_argument("--max_gen_len", type=int, default=800, help="生成的最大长度")
     parser.add_argument("--data_path", type=str, default="../dataset/rlaif-mini.jsonl", help="RLAIF数据路径")
     parser.add_argument("--clip_epsilon", type=float, default=0.1, help="PPO裁剪参数")
     parser.add_argument("--vf_coef", type=float, default=0.5, help="Value function系数")
@@ -297,7 +335,8 @@ if __name__ == "__main__":
         wandb.init(project=args.wandb_project, name=wandb_run_name, id=wandb_id, resume=resume)
     
     # ========== 5. 初始化模型和数据 ==========
-    base_weight = "reason" if args.reasoning == 1 else "full_sft"
+    #base_weight = "reason" if args.reasoning == 1 else "full_sft"
+    base_weight = "ppo_actor"
     # Actor模型
     actor_model, tokenizer = init_model(lm_config, base_weight, device=args.device)
     # Old Actor模型
@@ -315,12 +354,15 @@ if __name__ == "__main__":
     critic_model = critic_model.to(args.device)
     # Reward模型
     reward_model = AutoModel.from_pretrained(
-        args.reward_model_path, torch_dtype=torch.float16, trust_remote_code=True
+        args.reward_model_path, dtype=torch.float16, trust_remote_code=True
     )
     reward_model = reward_model.to(args.device).eval().requires_grad_(False)
     reward_tokenizer = AutoTokenizer.from_pretrained(args.reward_model_path, trust_remote_code=True)
     # 数据和优化器
-    train_ds = RLAIFDataset(args.data_path, tokenizer, max_length=(args.max_seq_len + args.max_gen_len))
+    if args.data_path.endswith('.csv'):
+        train_ds = CSVDataset(args.data_path, tokenizer, max_length=args.max_seq_len)
+    else:
+        train_ds = SFTDataset(args.data_path, tokenizer, max_length=args.max_seq_len)
     train_sampler = DistributedSampler(train_ds) if dist.is_initialized() else None
     actor_optimizer = optim.AdamW(actor_model.parameters(), lr=args.learning_rate)
     critic_optimizer = optim.AdamW(critic_model.parameters(), lr=args.critic_learning_rate)
@@ -358,9 +400,9 @@ if __name__ == "__main__":
             loader = DataLoader(train_ds, batch_sampler=batch_sampler, num_workers=args.num_workers, pin_memory=True)
             Logger(f'Epoch [{epoch + 1}/{args.epochs}]: 跳过前{start_step}个step，从step {start_step + 1}开始')
             ppo_train_epoch(epoch, loader, len(loader) + start_step + 1, old_actor_model, ref_model, 
-                           actor_scheduler, critic_scheduler, reward_model, reward_tokenizer, start_step, wandb)
+                           actor_scheduler, critic_scheduler, reward_model, reward_tokenizer, tokenizer, start_step, wandb)
         else:  # 默认从头开始
             loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=(train_sampler is None), 
                               sampler=train_sampler, num_workers=args.num_workers, pin_memory=True)
             ppo_train_epoch(epoch, loader, len(loader), old_actor_model, ref_model, 
-                           actor_scheduler, critic_scheduler, reward_model, reward_tokenizer, 0, wandb)
+                           actor_scheduler, critic_scheduler, reward_model, reward_tokenizer, tokenizer, 0, wandb)
