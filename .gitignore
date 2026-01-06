@@ -4,3 +4,4 @@ website/
 docs-minimind/
 checkpoints/
 dataset/*.jsonl
+lm-evaluation-harness
